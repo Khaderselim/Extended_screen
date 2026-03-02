@@ -28,9 +28,9 @@ public class Main {
     public static void main(String[] args) {
         int port = 1234;
         int screenIndex = 1;
-        int fps = 30;
-        // Increase default JPEG quality for clearer images
-        float quality = 1.0f;
+        int fps = 15;
+        // Reduce JPEG quality for faster encoding and lower bandwidth (less lag)
+        float quality = 0.7f;
 
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -80,7 +80,8 @@ public class Main {
     private static void handleClient(Socket client, int screenIndex, int fps, float quality) {
         DataOutputStream out = null;
         try {
-            out = new DataOutputStream(new BufferedOutputStream(client.getOutputStream()));
+            // Use a smaller buffer size to reduce buffering delays
+            out = new DataOutputStream(new BufferedOutputStream(client.getOutputStream(), 4096));
 
             GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
             GraphicsDevice[] devices = ge.getScreenDevices();
