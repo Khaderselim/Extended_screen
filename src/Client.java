@@ -10,14 +10,12 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.TreeMap;
 
-/**
- * Simple client that connects to the server and displays received JPEG frames via UDP.
- * Expects protocol: [4-byte frame_index][4-byte packet_index][4-byte total_packets][JPEG data]...
- */
+
 public class Client {
     private static volatile boolean running = true;
     private static final int HEADER_SIZE = 12;
     private static final int RECV_BUFFER_SIZE = 65507;
+    private static final int TILE_SIZE = 32;
 
     public static void main(String[] args) {
         String host = "localhost";
@@ -27,7 +25,7 @@ public class Client {
         ImagePanel panel = new ImagePanel();
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         frame.add(panel);
-        frame.setExtendedState(JFrame.MAXIMIZED_BOTH);
+
         frame.setUndecorated(false); // Set to true if you want to remove title bar
         frame.setVisible(true);
 
@@ -45,6 +43,10 @@ public class Client {
             // Map to store frame packets as we receive them
             Map<Integer, Map<Integer, byte[]>> framePackets = new HashMap<>();
             int lastDisplayedFrame = -1;
+            BufferedImage lastDisplayedImage = null; // For delta frame reconstruction
+            boolean receivedFirstFullFrame = false; // Track if we've gotten an initial full frame
+            boolean deltaEncodingActive = false; // Track when server switches to delta encoding
+            final int BOOTSTRAP_FRAMES = 10;
 
             while (running) {
                 byte[] buffer = new byte[RECV_BUFFER_SIZE];
@@ -59,8 +61,23 @@ public class Client {
 
                 int frameIndex = readInt(buffer, 0);
                 int packetIndex = readInt(buffer, 4);
-                int totalPackets = readInt(buffer, 8);
+                int totalPacketsValue = readInt(buffer, 8);
+                boolean isDeltaFrame = (totalPacketsValue & 0x80000000) != 0;
+                int totalPackets = totalPacketsValue & 0x7FFFFFFF;
                 int dataLen = packet.getLength() - HEADER_SIZE;
+
+                // Skip delta frames if we haven't received the first full frame yet
+                if (isDeltaFrame && !receivedFirstFullFrame) {
+                    System.out.println("Skipping delta frame " + frameIndex + " (waiting for first full frame)");
+                    continue;
+                }
+
+                // Also skip delta frames if they're for an earlier frame than what we've displayed
+                // (this handles out-of-order packet delivery)
+                if (isDeltaFrame && frameIndex <= lastDisplayedFrame) {
+                    System.out.println("Skipping delta frame " + frameIndex + " (already past this frame)");
+                    continue;
+                }
 
                 // Store packet
                 framePackets.computeIfAbsent(frameIndex, k -> new TreeMap<>())
@@ -74,13 +91,35 @@ public class Client {
                     for (int i = 0; i < totalPackets; i++) {
                         baos.write(packets.get(i));
                     }
-                    byte[] jpegData = baos.toByteArray();
+                    byte[] frameData = baos.toByteArray();
 
                     try {
-                        BufferedImage img = ImageIO.read(new ByteArrayInputStream(jpegData));
+                        BufferedImage img;
+                        if (isDeltaFrame) {
+                            // Decode delta frame
+                            img = decodeDeltaFrame(frameData, lastDisplayedImage);
+                            if (img != null) {
+                                System.out.println("Frame " + frameIndex + ": Delta frame decoded");
+                            }
+                        } else {
+                            // Decode full frame
+                            img = ImageIO.read(new ByteArrayInputStream(frameData));
+                            if (img != null) {
+                                System.out.println("Frame " + frameIndex + ": Full frame decoded [BOOTSTRAP " + (frameIndex + 1) + "/" + BOOTSTRAP_FRAMES + "]");
+                                receivedFirstFullFrame = true; // Mark that we've received first full frame
+                                
+                                // Check if we've completed bootstrap phase
+                                if (frameIndex == BOOTSTRAP_FRAMES - 1) {
+                                    System.out.println("=== HANDSHAKE COMPLETE: Ready for delta encoding ===");
+                                    deltaEncodingActive = true;
+                                }
+                            }
+                        }
+
                         if (img != null) {
                             panel.setImage(img);
                             lastDisplayedFrame = frameIndex;
+                            lastDisplayedImage = img;
                         } else {
                             System.err.println("Failed to decode image frame " + frameIndex);
                         }
@@ -104,6 +143,64 @@ public class Client {
                ((array[offset + 1] & 0xFF) << 16) |
                ((array[offset + 2] & 0xFF) << 8) |
                (array[offset + 3] & 0xFF);
+    }
+
+    private static short readShort(byte[] array, int offset) {
+        return (short) (((array[offset] & 0xFF) << 8) | (array[offset + 1] & 0xFF));
+    }
+
+    // Decode a delta frame by applying tile updates to the previous frame
+    private static BufferedImage decodeDeltaFrame(byte[] frameData, BufferedImage previousFrame) throws IOException {
+        if (previousFrame == null) {
+            System.err.println("Error: Delta frame received but no previous frame available");
+            return null;
+        }
+
+        DataInputStream dis = new DataInputStream(new ByteArrayInputStream(frameData));
+        
+        // Read header
+        byte frameType = dis.readByte();
+        if (frameType != 1) {
+            System.err.println("Error: Invalid frame type for delta frame");
+            return null;
+        }
+
+        int tilesHorizontal = dis.readShort();
+        int tilesVertical = dis.readShort();
+        int changedCount = dis.readShort();
+
+        // Create output image as copy of previous frame
+        BufferedImage result = new BufferedImage(
+            previousFrame.getWidth(), 
+            previousFrame.getHeight(), 
+            BufferedImage.TYPE_INT_RGB
+        );
+        Graphics2D g = result.createGraphics();
+        g.drawImage(previousFrame, 0, 0, null);
+        g.dispose();
+
+        // Apply tile updates
+        for (int i = 0; i < changedCount; i++) {
+            int tx = dis.readShort();
+            int ty = dis.readShort();
+            int tileJpegLen = dis.readShort();
+
+            byte[] tileJpeg = new byte[tileJpegLen];
+            dis.readFully(tileJpeg);
+
+            // Decode tile JPEG
+            BufferedImage tileImg = ImageIO.read(new ByteArrayInputStream(tileJpeg));
+            if (tileImg != null) {
+                // Draw tile onto result
+                int x = tx * TILE_SIZE;
+                int y = ty * TILE_SIZE;
+                g = result.createGraphics();
+                g.drawImage(tileImg, x, y, null);
+                g.dispose();
+            }
+        }
+
+        return result;
     }
 
     // Simple panel that paints the latest image centered and scaled to fit
